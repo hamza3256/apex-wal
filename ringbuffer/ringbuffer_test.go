@@ -241,3 +241,166 @@ func TestNextPowerOf2(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Benchmarks: RingBuffer vs. buffered channel
+// ---------------------------------------------------------------------------
+
+const (
+	benchBufSize  = 8192
+	benchSlotSize = 64
+	benchPairs    = 4
+)
+
+// payload reused across benchmark iterations (never escapes to heap).
+var benchPayload = make([]byte, benchSlotSize)
+
+// --- SPSC (single-producer, single-consumer) ------------------------------
+
+func BenchmarkRingBuffer_SPSC(b *testing.B) {
+	rb := New(benchBufSize, benchSlotSize)
+	buf := make([]byte, benchSlotSize)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	go func() {
+		for i := 0; i < b.N; i++ {
+			for !rb.Push(benchPayload) {
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	for i := 0; i < b.N; i++ {
+		for {
+			if _, ok := rb.Pop(buf); ok {
+				break
+			}
+			runtime.Gosched()
+		}
+	}
+}
+
+func BenchmarkChannel_SPSC(b *testing.B) {
+	ch := make(chan []byte, benchBufSize)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	go func() {
+		for i := 0; i < b.N; i++ {
+			ch <- benchPayload
+		}
+	}()
+
+	for i := 0; i < b.N; i++ {
+		<-ch
+	}
+}
+
+// --- MPMC (multi-producer, multi-consumer) --------------------------------
+
+func BenchmarkRingBuffer_MPMC(b *testing.B) {
+	rb := New(benchBufSize, benchSlotSize)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	opsPerPair := b.N / benchPairs
+
+	for p := 0; p < benchPairs; p++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerPair; j++ {
+				for !rb.Push(benchPayload) {
+					runtime.Gosched()
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, benchSlotSize)
+			for j := 0; j < opsPerPair; j++ {
+				for {
+					if _, ok := rb.Pop(buf); ok {
+						break
+					}
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func BenchmarkChannel_MPMC(b *testing.B) {
+	ch := make(chan []byte, benchBufSize)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	opsPerPair := b.N / benchPairs
+
+	for p := 0; p < benchPairs; p++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerPair; j++ {
+				ch <- benchPayload
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerPair; j++ {
+				<-ch
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// --- Batch Pop benchmark --------------------------------------------------
+
+func BenchmarkRingBuffer_BatchPop(b *testing.B) {
+	const batchSize = 16
+	rb := New(benchBufSize, benchSlotSize)
+
+	bufs := make([][]byte, batchSize)
+	for i := range bufs {
+		bufs[i] = make([]byte, benchSlotSize)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	go func() {
+		for i := 0; i < b.N; i++ {
+			for !rb.Push(benchPayload) {
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	consumed := 0
+	for consumed < b.N {
+		for i := range bufs {
+			bufs[i] = bufs[i][:cap(bufs[i])]
+		}
+		remaining := b.N - consumed
+		ask := batchSize
+		if remaining < ask {
+			ask = remaining
+		}
+		n := rb.PopBatch(bufs[:ask])
+		if n == 0 {
+			runtime.Gosched()
+			continue
+		}
+		consumed += n
+	}
+}
